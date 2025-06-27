@@ -72,4 +72,36 @@ class Node:
             self.cycle += 1
             self.transmit(target_count)
             time.sleep(gossip_rate)
-    
+
+    # Transmit data to randomly selected nodes (target_count)
+    def transmit(self, target_count):
+        new_time_key = self.gossip_counter
+
+        if self.data:
+            latest_entry = max(self.data.keys(), key=int)
+            latest_data = self.data[latest_entry].copy()
+        else:
+            latest_data = {}
+
+        latest_data[f"{self.ip}:{self.port}"] = get_new_data()
+        self.data[new_time_key] = latest_data
+
+        random_nodes = self.get_random_nodes(self.node_list, target_count)
+
+        for node in random_nodes:
+            self.send_to_node(node, new_time_key)
+
+    def prepare_metadata_and_own_fresh_data(self, time_key):
+        own_key = f"{self.ip}:{self.port}"
+        time_data = self.data[time_key]
+        own_recent_data = time_data[own_key]
+
+        metadata = {
+            key: node_data['counter']
+            for key, node_data in time_data.items()
+            if key != own_key and 'counter' in node_data
+        }
+
+        return {'metadata': metadata, own_key: own_recent_data}
+
+    # get new data function
