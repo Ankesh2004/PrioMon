@@ -104,4 +104,56 @@ class Node:
 
         return {'metadata': metadata, own_key: own_recent_data}
 
+    def prepare_requested_data(self, time_key, requested_keys):
+        requested_data = {}
+        for key in requested_keys:
+            requested_data[key] = self.data[time_key][key]
+        return requested_data
+    
+    def update_own_data(self, updates, new_time_key):
+        for u_key in updates:
+            self.data_flow_per_round.setdefault(self.cycle, {})
+            if u_key in self.data[new_time_key]:
+                self.data_flow_per_round[self.cycle].setdefault('fd', 0)
+                self.data_flow_per_round[self.cycle]['fd'] += 1
+            else:
+                self.data_flow_per_round[self.cycle].setdefault('nd', 0)
+                self.data_flow_per_round[self.cycle].setdefault('fd', 0)
+                self.data_flow_per_round[self.cycle]['nd'] += 1
+                self.data_flow_per_round[self.cycle]['fd'] += 1
+            self.data[new_time_key][u_key] = updates[u_key]
+
+        pass
+
+    def push_latest_data_and_delete_after_push(self):
+        if self.data:
+            latest_time_key = max(self.data.keys())
+            latest_data = self.data[latest_time_key]
+            to_send = self.data
+            self.data = {latest_time_key: latest_data}
+            to_push = {k: v for k, v in to_send.items() if k != latest_time_key}
+            self.session_to_monitoring.post(
+                'http://{}:{}/push_data_to_database?ip={}&port={}&round={}'.format(self.monitoring_address,self.client_port ,self.ip,
+                                                                                 self.port,
+                                                                                 self.cycle), json=to_push)
+    
+    def send_to_node(self, n, new_time_key):
+        data = self.prepare_metadata_and_own_fresh_data(new_time_key)
+        try:
+            r_metadata_and_updated = requests.post(
+                'http://' + n["ip"] + ':' + '5000' + '/receive_metadata',
+                json=data)
+
+            requested_keys = r_metadata_and_updated.json()['requested_keys']
+            requested_data = self.prepare_requested_data(new_time_key, requested_keys)
+            response = requests.get(
+                'http://' + n["ip"] + ':' + '5000' + '/receive_message?inc_round={}'.format(self.cycle),
+                json=requested_data)
+            self.update_own_data(r_metadata_and_updated.json()['updates'], new_time_key)
+            if response.status_code == 500:
+                self.update_failure_data(new_time_key, n)
+            else:
+                self.reset_failure_data(new_time_key, n["ip"] + ':' + n["port"])
+        except Exception as e:
+            logging.error("Error while sending message to node {}: {}".format(n, e))
     # get new data function
