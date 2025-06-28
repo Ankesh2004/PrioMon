@@ -8,7 +8,35 @@ import logging
 import hashlib
 import json
 import secrets
+import math
 
+logger = logging.getLogger("demon.metrics")
+
+# Priority levels
+PRIORITY_HIGH = 1     # Update every round
+PRIORITY_MEDIUM = 5   # Update every 5 rounds
+PRIORITY_LOW = 10     # Update every 10 rounds
+
+# Configure priorities for different metrics
+METRIC_PRIORITIES = {
+    "cpu": PRIORITY_HIGH,      # CPU is critical - update every round
+    "memory": PRIORITY_MEDIUM, # Memory - update every 5 rounds
+    "network": PRIORITY_MEDIUM, # Network - update every 5 rounds
+    "storage": PRIORITY_LOW    # Storage changes slowly - update every 10 rounds
+}
+
+# Delta thresholds for each metric (minimum change to trigger update)
+METRIC_DELTAS = {
+    "cpu": 5.0,      # 5% change in CPU
+    "memory": 7.0,   # 7% change in memory
+    "network": 15.0, # 15% change in network
+    "storage": 10.0  # 10% change in storage
+}
+
+# Track last values to calculate deltas
+last_metric_values = {}
+# Track when each metric was last sent
+last_metric_sent_round = {}
 
 @Singleton
 class Node:
@@ -156,4 +184,32 @@ class Node:
                 self.reset_failure_data(new_time_key, n["ip"] + ':' + n["port"])
         except Exception as e:
             logging.error("Error while sending message to node {}: {}".format(n, e))
+
+    def update_failure_data(self, new_time_key, n):
+        if self.ip + ':' + self.port not in self.data[new_time_key].get(n["ip"] + ':' + n["port"], {}).get("hbState",
+                                                                                                           {}).get(
+            "failureList", []):
+            self.data[new_time_key][n["ip"] + ':' + n["port"]]["hbState"]["failureList"].append(
+                self.ip + ':' + self.port)
+            f_count = self.data[new_time_key].get(n["ip"] + ':' + n["port"], {}).get("hbState", {}).get("failureCount",
+                                                                                                        0) + 1
+            if f_count >= 3:
+                self.delete_node_from_nodelist(n["ip"] + ':' + n["port"])
+                self.data[new_time_key][n["ip"] + ':' + n["port"]]["hbState"]["nodeAlive"] = False
+        pass
+
+    def delete_node_from_nodelist(self, key_to_delete):
+        self.node_list.pop(key_to_delete)
+
+    def reset_failure_data(self, new_time_key, ip_key):
+        if ip_key in self.data[new_time_key]:
+            self.data[new_time_key][ip_key]["hbState"]["failureCount"] = 0
+            self.data[new_time_key][ip_key]["hbState"]["nodeAlive"] = True
+            self.data[new_time_key][ip_key]["hbState"]["failureList"] = []
+        else:
+            self.data[new_time_key].setdefault(ip_key, {}).setdefault("hbState", {})[
+                "failureCount"] = 0
+            self.data[new_time_key].setdefault(ip_key, {}).setdefault("hbState", {})[
+                "failureList"] = []
+            self.data[new_time_key][ip_key]["hbState"]["nodeAlive"] = True
     # get new data function
