@@ -38,6 +38,112 @@ last_metric_values = {}
 # Track when each metric was last sent
 last_metric_sent_round = {}
 
+def get_new_data():
+    node = Node.instance()
+    network = psutil.net_io_counters().bytes_recv + psutil.net_io_counters().bytes_sent
+    
+    # Get current metric values
+    current_metrics = {
+        "cpu": psutil.cpu_percent(),
+        "memory": psutil.virtual_memory().percent,
+        "network": network,
+        "storage": psutil.disk_usage('/').free
+    }
+    
+    # Determine which metrics to send based on priority and delta
+    metrics_to_send = {}
+    metrics_filtered = {}
+    
+    for metric, value in current_metrics.items():
+        if should_send_metric(node, metric, value):
+            metrics_to_send[metric] = value
+        else:
+            metrics_filtered[metric] = value
+    
+    # Create the data structure with only selected metrics
+    app_state = {}
+    for metric in metrics_to_send:
+        app_state[metric] = str(metrics_to_send[metric])
+    
+    # Track metrics statistics for this round
+    node.data_flow_per_round.setdefault(node.cycle, {})
+    node.data_flow_per_round[node.cycle]['metrics_sent'] = len(metrics_to_send)
+    node.data_flow_per_round[node.cycle]['metrics_filtered'] = len(metrics_filtered)
+    
+    # Store data about which metrics were sent this round
+    metric_flags = {metric: (metric in metrics_to_send) for metric in current_metrics}
+    
+    data = {
+        "counter": "{}".format(node.gossip_counter),
+        "cycle": "{}".format(node.cycle),
+        "digest": "",
+        "nodeState": {
+            "id": "",
+            "ip": "{}".format(node.ip),
+            "port": "{}".format(node.port)},
+        "hbState": {
+            "timestamp": "{}".format(time.time()),
+            "failureCount": node.failure_counter,
+            "failureList": node.failure_list,
+            "nodeAlive": node.is_alive},
+        "appSate": app_state,
+        "nfState": {},
+        "metric_sent_flags": metric_flags
+    }
+    
+    digest = mk_digest(data)
+    data["digest"] = digest
+    
+    return data
+
+
+def should_send_metric(node, metric, value):
+    if metric not in last_metric_values:
+        last_metric_values[metric] = value
+        last_metric_sent_round[metric] = 0
+        return True  # Always send first time
+        
+    # Get priority for this metric
+    priority = METRIC_PRIORITIES.get(metric, PRIORITY_HIGH)
+    
+    # Calculate rounds since last sent
+    rounds_since_sent = node.cycle - last_metric_sent_round[metric]
+    
+    # Calculate delta (percent change) for numeric metrics
+    if isinstance(value, (int, float)) and isinstance(last_metric_values[metric], (int, float)) and last_metric_values[metric] != 0:
+        if metric == "network" or metric == "storage":
+            # For network and storage, calculate absolute change
+            delta_percent = abs(value - last_metric_values[metric]) / max(value, last_metric_values[metric]) * 100
+        else:
+            # For CPU and memory, calculate percentage point change
+            delta_percent = abs(value - last_metric_values[metric])
+    else:
+        delta_percent = float('inf')  # Always send non-numeric or zero-based values
+        
+    # Determine if we should send this metric
+    should_send = False
+    
+    # Always send high priority metrics
+    if priority == PRIORITY_HIGH:
+        should_send = True
+    # Send medium/low priority metrics based on schedule or significant change
+    elif rounds_since_sent >= priority:
+        should_send = True
+    # Send if significant change detected
+    elif delta_percent >= METRIC_DELTAS.get(metric, 0):
+        should_send = True
+        
+    # Update last sent round if sending
+    if should_send:
+        last_metric_sent_round[metric] = node.cycle
+    
+    # Always update last value for future delta calculations
+    last_metric_values[metric] = value
+    
+    logger.debug(f"METRIC_PRIORITY: metric={metric}, value={value:.2f}, priority={priority}, " +
+                f"delta={delta_percent:.2f}%, rounds_since_sent={rounds_since_sent}, decision={'SEND' if should_send else 'SKIP'}")
+    
+    return should_send
 @Singleton
 class Node:
     def __init__(self):
@@ -59,6 +165,7 @@ class Node:
         self.session_to_monitoring = requests.Session()
         self.push_mode = None
         self.is_send_data_back = None
+        self.metric_last_sent = {}
 
     def set_params(self, ip, port, cycle, node_list, data, is_alive, gossip_counter, failure_counter,
                    monitoring_address, database_address, is_send_data_back, client_thread, counter_thread, data_flow_per_round, push_mode, client_port):
@@ -124,13 +231,15 @@ class Node:
         time_data = self.data[time_key]
         own_recent_data = time_data[own_key]
 
+        filtered_own_data = self.get_filtered_data_by_priority(own_recent_data)
+
         metadata = {
             key: node_data['counter']
             for key, node_data in time_data.items()
             if key != own_key and 'counter' in node_data
         }
 
-        return {'metadata': metadata, own_key: own_recent_data}
+        return {'metadata': metadata, own_key: filtered_own_data}
 
     def prepare_requested_data(self, time_key, requested_keys):
         requested_data = {}
@@ -152,6 +261,34 @@ class Node:
             self.data[new_time_key][u_key] = updates[u_key]
 
         pass
+    def get_filtered_data_by_priority(self, full_data):
+        """Filter metrics based on priority and round number"""
+        if not hasattr(self, 'metric_last_sent'):
+            self.metric_last_sent = {}
+        
+        filtered_data = full_data.copy()
+        # not filtering if first cycle
+        if self.cycle <= 1:
+            for metric in METRIC_PRIORITIES:
+                self.metric_last_sent[metric] = self.cycle
+            return filtered_data
+        
+        if "appSate" in filtered_data:
+            app_state = filtered_data["appSate"].copy()
+            for metric, priority in METRIC_PRIORITIES.items():
+                last_sent = self.metric_last_sent.get(metric, 0)
+                if (self.cycle - last_sent) < priority:
+                    # Remove metrics that don't need to be sent this round
+                    if metric in app_state:
+                        app_state[metric] = "not_updated"
+                else:
+                    # Update last sent time for metrics being sent
+                    self.metric_last_sent[metric] = self.cycle
+            
+            filtered_data["appSate"] = app_state
+        
+        return filtered_data
+
 
     def push_latest_data_and_delete_after_push(self):
         if self.data:
@@ -212,4 +349,3 @@ class Node:
             self.data[new_time_key].setdefault(ip_key, {}).setdefault("hbState", {})[
                 "failureList"] = []
             self.data[new_time_key][ip_key]["hbState"]["nodeAlive"] = True
-    # get new data function
