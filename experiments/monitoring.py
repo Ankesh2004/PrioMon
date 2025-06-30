@@ -31,6 +31,52 @@ except Exception as e:
     exit(1)
 experiment = None
 
+def execute_queries_from_queue():
+    while True:
+        try:
+            conn = sqlite3.connect('demonDB.db', check_same_thread=False)
+            cursor = conn.cursor()
+            query_data = experiment.query_queue.get()
+            if query_data is None:
+                break  # Signal to exit the thread
+            query, parameters = query_data
+            cursor.execute(query, parameters)
+            conn.commit()
+            experiment.query_queue.task_done()
+        except Exception as e:
+            print("Error db: {}".format(e))
+            print("trace: {}".format(traceback.format_exc()))
+            continue
+
+def get_target_count(node_count, target_count_range):
+    new_range = []
+    for i in target_count_range:
+        if i <= node_count:
+            new_range.append(i)
+    return new_range
+
+def get_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def make_save_able_dic_from_run(run):
+    save_able_dic = {"node_count": run.node_count, "target_count": run.target_count, "gossip_rate": run.gossip_rate,
+                     "start_time": run.start_time, "convergence_time": run.convergence_time,
+                     "convergence_message_count": run.convergence_message_count,
+                     "convergence_round": run.convergence_round}
+    return save_able_dic
+
+def save_run_to_database(run):
+    run.db_id = experiment.db.insert_into_run(experiment.db_id, run.run, run.node_count, run.gossip_rate,
+                                              run.target_count)
+
+def save_converged_run_to_database(run):
+    experiment.db.insert_into_converged_run(run.db_id, run.convergence_round, run.convergence_message_count,
+                                            run.convergence_time)
+
 class Run:
     def __init__(self, node_count, gossip_rate, target_count, run, node_list=None, db_collection=None):
         self.db_id = -1
