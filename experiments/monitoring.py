@@ -190,5 +190,64 @@ def restart_all_nodes(run):
             executor.submit(restart_node, run.node_list[i]["id"])
     print("Restart time: {}".format(time.time() - start), flush=True)
 
+def start_node(index, run, database_address, monitoring_address, ip):
+    to_send = {"node_list": run.node_list, "target_count": run.target_count, "gossip_rate": run.gossip_rate,
+               "database_address": database_address, "monitoring_address": monitoring_address,
+               "node_ip": run.node_list[index]["ip"], "is_send_data_back": experiment.is_send_data_back,
+               "push_mode": experiment.push_mode, "client_port": "4000"}
+    try:
+        time.sleep(0.01)
+        requests.post("http://{}:{}/start_node".format(ip, run.node_list[index]["port"]), json=to_send)
+    except Exception as e:
+        print("Node not started: {}".format(e))
+        start_node(index, run, database_address, monitoring_address, ip)
+
+def start_run(run, monitoring_address):
+    database_address = parser.get('database', 'db_file')
+    ip = parser.get('system_setting', 'docker_ip')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=run.node_count) as executor:
+        for i in range(0, run.node_count):
+            executor.submit(start_node, i, run, database_address, monitoring_address, ip)
+    run.start_time = time.time()
+
+def reset_run_sync(run):
+    ip = parser.get('system_setting', 'docker_ip')
+    print("Resetting nodes", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=run.node_count) as executor:
+        for i in range(0, run.node_count):
+            executor.submit(reset_node, ip, run.node_list[i]["port"], run.node_list[i]["id"])
+
+def prepare_run(run):
+    spawn_multiple_nodes(run)
+    while not nodes_are_ready(run):
+        time.sleep(1)
+    save_run_to_database(run)
+    print("Run {} started".format(run.db_id), flush=True)
+    time.sleep(10)
+
+def check_if_all_nodes_are_reset(run):
+    for node in run.node_list:
+        if node["is_alive"]:
+            return False
+    return True
+
+def stop_node_percentage(run, percent):
+    print("stopping percentage of nodes: {}".format(percent))
+    if percent == 0:
+        return
+    nodes_to_stop_count = int(len(run.node_list) * percent)
+    indices = list(range(len(run.node_list)))
+    random_indices_to_stop = random.sample(indices, nodes_to_stop_count)
+    for i in random_indices_to_stop:
+        try:
+            container_to_stop = docker_client.containers.get(run.node_list[i]["id"])
+            container_to_stop.stop()
+            run.node_list[i]["is_alive"] = False
+            run.stopped_nodes[i] = run.node_list[i]
+        except Exception as e:
+            print("An error occurred while stopping container: {}".format(e))
+    print("{}% of nodes (n={}) are stopped".format(percent * 100, nodes_to_stop_count))
+    return
+
 if __name__ == "__main__":
     monitoring_priomon.run(host='0.0.0.0', port=4000, debug=False, threaded=True)
