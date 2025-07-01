@@ -249,5 +249,85 @@ def stop_node_percentage(run, percent):
     print("{}% of nodes (n={}) are stopped".format(percent * 100, nodes_to_stop_count))
     return
 
+def run_converged(run):
+    run.convergence_message_count = run.message_count
+    run.convergence_time = (time.time() - run.start_time)
+    # TODO: set convergence round
+    if not run.is_converged:
+        print("Convergence time: {}".format(run.convergence_time))
+        print("Convergence message count: {}".format(run.convergence_message_count))
+
+    run.is_converged = True
+
+def check_convergence(run):
+    if run.is_converged:
+        return True
+    if len(run.data_entries_per_ip) < run.node_count:
+        return False
+    for ip in run.data_entries_per_ip:
+        if len(run.data_entries_per_ip[ip]) < run.node_count:
+            return False
+        if len(run.data_entries_per_ip[ip]) > run.node_count:
+            return False
+        for node_data in run.data_entries_per_ip[ip]:
+            if "counter" not in run.data_entries_per_ip[ip][node_data]:
+                return False
+    run_converged(run)
+
+def save_query_in_database(run, i, failure_percent, target_key, time_to_query, total_messages_for_query, success):
+    experiment.db.save_query_in_database(run.db_id, run.node_count, i, failure_percent, time_to_query,
+                                         total_messages_for_query, success)
+    pass
+
+def run_queries(run, query_count, failure_percent):
+    docker_ip = parser.get('system_setting', 'docker_ip')
+    quorum_size = 3
+    for i in range(0, query_count):
+        alive_nodes = [item for item in run.node_list if item.get("is_alive", False)]
+        
+        # Skip this query if there are no alive nodes
+        if not alive_nodes:
+            print("No alive nodes available for querying")
+            continue
+            
+        # Select target node only from alive nodes
+        target_node = random.choice(alive_nodes)
+        target_key = target_node["ip"] + ":" + target_node["port"]
+        
+        try:
+            start_time = time.time()
+            total_messages_for_query, query_result = query_client.query(
+                alive_nodes, quorum_size, target_node["ip"], target_node["port"], docker_ip
+            )
+            time_to_query = time.time() - start_time
+            success = True
+        except Exception as e:
+            print(f"Query failed: {e}")
+            time_to_query = time.time() - start_time
+            total_messages_for_query = 0
+            success = False
+            
+        save_query_in_database(run, i, failure_percent, target_key, time_to_query, 
+                              total_messages_for_query, success)
+
+def update_during_run(run):
+    # TODO: stop percentage of nodes and check AoI etc. (update run.node_list or stop logic (convergence) if wanted)
+    # before convergence do something
+    while not run.is_converged:
+        pass
+    print(parser.get('DemonParam', 'continue_after_convergence'))
+    if parser.get('DemonParam', 'continue_after_convergence') == "1":
+        print("Convergence reached, continuing run")
+        while not run.max_round_is_reached:
+            pass
+        print("Max round reached: stop now")
+    print("should start queries now")
+    if parser.get('system_setting', 'query_logic') == "1":
+        print(parser.get('system_setting', 'failure_rate'))
+        failure_ratio = float(parser.get('system_setting', 'failure_rate'))
+        stop_node_percentage(run, failure_ratio)
+        time.sleep(20)
+        run_queries(run, query_count=100, failure_percent=failure_ratio)
+
 if __name__ == "__main__":
     monitoring_priomon.run(host='0.0.0.0', port=4000, debug=False, threaded=True)
