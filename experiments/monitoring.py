@@ -122,7 +122,7 @@ class Experiment:
 
 def spawn_node(index, node_list, client, custom_network_name):
     try:
-        new_node = docker_client.containers.run("demonv1", auto_remove=True, detach=True,
+        new_node = docker_client.containers.run("priomonv1", auto_remove=True, detach=True,
                                                 network_mode=custom_network_name,
                                                 ports={'5000': node_list[index]["port"]})
     except Exception as e:
@@ -177,7 +177,7 @@ def reset_node(ip, port, docker_id):
 
 @monitoring_priomon.route('/delete_nodes', methods=['GET'])
 def delete_all_nodes():
-    to_remove = docker_client.containers.list(filters={"ancestor": "demonv1"})
+    to_remove = docker_client.containers.list(filters={"ancestor": "priomonv1"})
     for node in to_remove:
         node.remove(force=True)
     return "OK"
@@ -315,8 +315,8 @@ def update_during_run(run):
     # before convergence do something
     while not run.is_converged:
         pass
-    print(parser.get('DemonParam', 'continue_after_convergence'))
-    if parser.get('DemonParam', 'continue_after_convergence') == "1":
+    print(parser.get('PriomonParam', 'continue_after_convergence'))
+    if parser.get('PriomonParam', 'continue_after_convergence') == "1":
         print("Convergence reached, continuing run")
         while not run.max_round_is_reached:
             pass
@@ -329,5 +329,190 @@ def update_during_run(run):
         time.sleep(20)
         run_queries(run, query_count=100, failure_percent=failure_ratio)
 
+connection_pool = sqlite3.connect("NodeStorage.db", check_same_thread=False, isolation_level=None)
+database_lock = threading.Lock()
+
+@monitoring_priomon.route('/push_data_to_database', methods=['POST'])
+def push_data_to_database():
+    client_ip = request.args.get('ip')
+    client_port = request.args.get('port')
+    client_round = request.args.get('round')
+    data = request.get_json()
+    node_key = client_ip + ":" + client_port
+
+    # Acquire the lock
+    with database_lock:
+        # Use a connection from the pool
+        connection: Connection = connection_pool
+        cursor = connection.cursor()
+
+        for r, va in data.items():
+            for k, j in va.items():
+                v = json.dumps(j)
+                cursor.execute('SELECT id FROM unique_entries WHERE key=? AND value=?', (k, v))
+                existing_entry = cursor.fetchone()
+                if existing_entry:
+                    unique_entry_id = existing_entry[0]
+                else:
+                    cursor.execute('INSERT INTO unique_entries (key, value) VALUES (?, ?)', (k, v))
+                    unique_entry_id = cursor.lastrowid
+
+                cursor.execute('INSERT INTO data_entries (node, round, key, unique_entry_id) VALUES (?, ?, ?, ?)',
+                               (node_key, client_round, k, unique_entry_id))
+        connection_pool.commit()
+
+    return "OK"
+
+@monitoring_priomon.route('/receive_ic', methods=['GET'])
+def update_ic():
+    client_ip = request.args['ip']
+    client_port = request.args['port']
+    experiment.runs[-1].ip_per_ic[client_ip + ":" + client_port] = True
+    if len(experiment.runs[-1].ip_per_ic) == experiment.runs[-1].node_count:
+        run_converged(experiment.runs[-1])
+    return "OK"
+
+@monitoring_priomon.route('/receive_node_data', methods=['POST'])
+def update_data_entries_per_ip():
+    global experiment
+    if not experiment:
+        print("No experiment running, but a gossip node is trying to send data")
+        return "NOK"
+    client_ip = request.args['ip']
+    client_port = request.args['port']
+    round = request.args['round']
+    inc = request.get_json()
+    data_stored_in_node = inc["data"]
+    data_flow_per_round = inc["data_flow_per_round"]
+
+    nd = data_flow_per_round.setdefault('nd', 0)
+    fd = data_flow_per_round.setdefault('fd', 0)
+    rm = data_flow_per_round.setdefault('rm', 0)
+
+    ic = len(data_stored_in_node)
+    bytes_of_data = len(json.dumps(data_stored_in_node).encode('utf-8'))
+
+    experiment.runs[-1].convergence_round = max(experiment.runs[-1].convergence_round, int(round))
+    experiment.runs[-1].message_count += 1
+    experiment.runs[-1].data_entries_per_ip[client_ip + ":" + client_port] = data_stored_in_node
+    if not experiment.runs[-1].is_converged:
+        if int(nd) > experiment.runs[-1].node_count:
+            nd = experiment.runs[-1].node_count
+        if int(fd) > experiment.runs[-1].node_count:
+            fd = experiment.runs[-1].node_count
+        delete_parameters = (experiment.runs[-1].db_id, client_ip, client_port, round)
+        insert_parameters = (experiment.runs[-1].db_id, client_ip, client_port, round, nd, fd, rm, ic, bytes_of_data)
+        experiment.query_queue.put(
+            ("DELETE FROM round_of_node WHERE run_id = ? AND ip = ? AND port = ? AND round = ?", delete_parameters))
+        experiment.query_queue.put((
+                                   "INSERT INTO round_of_node (run_id, ip, port, round, nd, fd, rm, ic, bytes_of_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                   insert_parameters))
+    
+    # Extract metrics statistics if available
+    metrics_sent = data_flow_per_round.get('metrics_sent', 0)
+    metrics_filtered = data_flow_per_round.get('metrics_filtered', 0)
+    
+    # Store metrics statistics
+    if metrics_sent > 0 or metrics_filtered > 0:
+        metrics_params = (experiment.runs[-1].db_id, client_ip, client_port, round, 
+                         metrics_sent, metrics_filtered, time.time())
+        experiment.query_queue.put((
+            "INSERT INTO round_metrics_stats (run_id, node_ip, node_port, round, metrics_sent, metrics_filtered, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            metrics_params))
+    
+    # Store detailed per-metric transmission data
+    if client_ip + ":" + client_port in data_stored_in_node:
+        node_data = data_stored_in_node[client_ip + ":" + client_port]
+        if 'metric_sent_flags' in node_data:
+            timestamp = time.time()
+            for metric_type, was_sent in node_data['metric_sent_flags'].items():
+                # Get metric value if available
+                metric_value = None
+                if 'appSate' in node_data and metric_type in node_data['appSate']:
+                    try:
+                        metric_value = float(node_data['appSate'][metric_type])
+                    except (ValueError, TypeError):
+                        pass
+            
+                # Queue the database insert
+                metric_params = (experiment.runs[-1].db_id, client_ip, client_port, round, 
+                                metric_type, 1 if was_sent else 0, metric_value, timestamp)
+                experiment.query_queue.put((
+                    "INSERT INTO metric_transmissions (run_id, node_ip, node_port, round, metric_type, was_sent, metric_value, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    metric_params))
+    
+    check_convergence(experiment.runs[-1])
+    if int(round) >= 80:
+        run_converged(experiment.runs[-1])
+        experiment.runs[-1].max_round_is_reached = True
+    return "OK"
+
+def generate_run(node_count, gossip_rate, target_count, run_count):
+    if experiment.runs:
+        return Run(node_count, gossip_rate, target_count, run_count, node_list=experiment.runs[-1].node_list)
+    return Run(node_count, gossip_rate, target_count, run_count)
+
+def prepare_experiment(server_ip):
+    global experiment
+    experiment = Experiment(json.loads(parser.get('PriomonParam', 'node_range')),
+                            json.loads(parser.get('PriomonParam', 'gossip_rate_range')),
+                            json.loads(parser.get('PriomonParam', 'target_count_range')),
+                            json.loads(parser.get('PriomonParam', 'runs')),
+                            server_ip,
+                            parser.get('system_setting', 'is_send_data_back'),
+                            parser.get('PriomonParam', 'push_mode'))
+    experiment.set_db_id(experiment.db.insert_into_experiment(time.time()))
+    experiment.query_thread = threading.Thread(target=execute_queries_from_queue)
+    experiment.query_thread.start()
+
+def print_experiment():
+    experiment.query_queue.put(None)
+    experiment.query_thread.join()
+    for run in experiment.runs:
+        print("Run {}, converged after {} messages and {} seconds".format(run.node_count, run.convergence_message_count,
+                                                                          run.convergence_time))
+
+@monitoring_priomon.route('/start', methods=['GET'])
+def start_priomon():
+    server_ip = socket.gethostbyname(socket.gethostname())
+    print("Server IP: {}".format(server_ip))
+    global experiment
+    prepare_experiment(server_ip)
+    for node_count in experiment.node_count_range:
+        new_target_count_range = get_target_count(node_count, experiment.target_count_range)
+        for target_count in new_target_count_range:
+            for gossip_rate in experiment.gossip_rate_range:
+                for run_count in range(0, experiment.run_count):
+                    print("Preparing run with {} nodes, {} gossip rate, {} target count and {} run count".format(
+                        node_count, gossip_rate, target_count, run_count))
+                    run = generate_run(node_count, gossip_rate, target_count, run_count)  # db_collection=collection)
+                    experiment.runs.append(run)
+                    prepare_run(run)
+                    print("Run {} prepared, with {} nodes online".format(run.run, len(run.node_list)))
+                    start_run(run, experiment.monitoring_address_ip)
+                    update_during_run(run)
+                    save_converged_run_to_database(run)
+                    reset_run_sync(run)
+    print_experiment()
+    delete_all_nodes()
+    return "OK - Experiment finished"
+
+def create_and_start_priomon_node(node_number, node_list, target_count, gossip_rate):    
+    # metric priority configuration
+    node_data = {
+        "metric_priorities": {
+            "cpu": int(parser.get('MetricPriorities', 'cpu_priority', fallback=1)),
+            "memory": int(parser.get('MetricPriorities', 'memory_priority', fallback=5)),
+            "network": int(parser.get('MetricPriorities', 'network_priority', fallback=5)),
+            "storage": int(parser.get('MetricPriorities', 'storage_priority', fallback=10))
+        },
+        "metric_deltas": {
+            "cpu": float(parser.get('MetricDeltas', 'cpu_delta', fallback=5.0)),
+            "memory": float(parser.get('MetricDeltas', 'memory_delta', fallback=7.0)),
+            "network": float(parser.get('MetricDeltas', 'network_delta', fallback=15.0)),
+            "storage": float(parser.get('MetricDeltas', 'storage_delta', fallback=10.0))
+        }
+    }
+    
 if __name__ == "__main__":
     monitoring_priomon.run(host='0.0.0.0', port=4000, debug=False, threaded=True)
