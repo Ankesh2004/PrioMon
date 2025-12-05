@@ -1,4 +1,5 @@
 # PrioMon - Priority-based Distributed System Monitoring
+<img width="2752" height="1536" alt="priomon-banner" src="https://github.com/user-attachments/assets/71820135-121b-4458-977b-b114cd4d507d" />
 
 PrioMon is a distributed system monitoring framework that uses priority-based gossip protocols to efficiently monitor system metrics across distributed nodes. The system allows for configurable monitoring priorities and adaptive resource allocation based on metric importance.
 
