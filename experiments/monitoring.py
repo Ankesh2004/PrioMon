@@ -35,20 +35,55 @@ experiment = None
 run_lock = threading.Lock()
 
 def execute_queries_from_queue():
+    # keep the connection open for the lifetime of the thread for speed
+    conn = sqlite3.connect('priomonDB.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # how many queries to bundle before one disk sync
+    batch_size = 50
+    pending_items = []
+    
     while True:
+        query_data = None
         try:
-            conn = sqlite3.connect('priomonDB.db', check_same_thread=False)
-            cursor = conn.cursor()
             query_data = experiment.query_queue.get()
             if query_data is None:
-                break  # Signal to exit the thread
+                # final flush before exiting
+                if pending_items:
+                    conn.commit()
+                    for _ in pending_items:
+                        experiment.query_queue.task_done()
+                break
+
             query, parameters = query_data
             cursor.execute(query, parameters)
-            conn.commit()
-            experiment.query_queue.task_done()
+            pending_items.append(query_data)
+            
+            # commit if batch is full or if the queue is temporarily empty 
+            if len(pending_items) >= batch_size or experiment.query_queue.empty():
+                conn.commit()
+                for _ in pending_items:
+                    experiment.query_queue.task_done()
+                pending_items = []
+
         except Exception as e:
-            print("Error db: {}".format(e))
+            # if anything fails, we gotta rollback to prevent a stuck transaction
+            print("Error db batch: {}".format(e))
             print("trace: {}".format(traceback.format_exc()))
+            try:
+                conn.rollback()
+            except:
+                pass
+            
+            # cleanup: mark everything in the failed batch as done so the queue doesn't hang
+            for _ in pending_items:
+                experiment.query_queue.task_done()
+            pending_items = []
+            
+            # if the current item is also problematic, mark it too
+            if query_data is not None:
+                experiment.query_queue.task_done()
+            
             continue
 
 def get_target_count(node_count, target_count_range):

@@ -2,7 +2,7 @@
 
 This directory contains the orchestration logic used to run simulations, monitor convergence, and analyze the performance of the PrioMon gossip protocol.
 
-## 📜 Core Components
+##  Core Components
 
 ### `monitoring.py`
 The heart of the simulation. It acts as both a Flask control server and a metric aggregator.
@@ -21,7 +21,7 @@ The database abstraction layer for the experiments.
 - **SSD Safety**: Configured with `WAL` mode and `synchronous = NORMAL` to prevent excessive disk wear during high-throughput logging.
 - **Schema Management**: Handles the creation and management of experiment, run, and query tables.
 
-## ⚙️ How to Configure
+## How to Configure
 
 All simulation parameters are stored in `config.ini`:
 - `PriomonParam`: Control node counts, gossip rates, and network ports.
