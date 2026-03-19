@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 import concurrent.futures
 import configparser
 import json
@@ -16,13 +16,14 @@ import threading
 from flask import Flask, request
 from joblib import Parallel, delayed
 import connector_db as dbConnector
-import logging
 from sqlite3 import Connection
 from src import query_client
 
+session = requests.Session()
+
 monitoring_priomon = Flask(__name__)
 parser = configparser.ConfigParser()
-parser.read('../config.ini')
+parser.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
 try:
     docker_client = docker.client.from_env()
 except Exception as e:
@@ -30,6 +31,8 @@ except Exception as e:
     print("trace: {}".format(traceback.format_exc()))
     exit(1)
 experiment = None
+# protects concurrent reads/writes to run state from Flask threads
+run_lock = threading.Lock()
 
 def execute_queries_from_queue():
     while True:
@@ -110,7 +113,7 @@ class Experiment:
         self.run_count = run_count
         self.runs = []
         self.monitoring_address_ip = monitoring_address_ip
-        self.db = dbConnector.PriomonDB()
+        self.db = dbConnector.PrioMonDB()
         self.query_queue = queue.Queue()
         self.query_thread = None
         self.is_send_data_back = is_send_data_back
@@ -120,7 +123,12 @@ class Experiment:
     def set_db_id(self, param):
         self.db_id = param
 
-def spawn_node(index, node_list, client, custom_network_name):
+MAX_SPAWN_RETRIES = 5
+
+def spawn_node(index, node_list, client, custom_network_name, retries=0):
+    if retries >= MAX_SPAWN_RETRIES:
+        print("Failed to spawn node {} after {} retries, giving up".format(index, MAX_SPAWN_RETRIES))
+        return
     try:
         new_node = docker_client.containers.run("priomonv1", auto_remove=True, detach=True,
                                                 network_mode=custom_network_name,
@@ -129,7 +137,7 @@ def spawn_node(index, node_list, client, custom_network_name):
         print("Node not spawned: {}".format(e))
         print("trace: {}".format(traceback.format_exc()))
         node_list[index]["port"] = get_free_port()
-        spawn_node(index, node_list, client, custom_network_name)
+        spawn_node(index, node_list, client, custom_network_name, retries + 1)
     else:
         node_details = client.containers.get(new_node.id)
         node_list[index] = {"id": node_details.id,
@@ -170,7 +178,7 @@ def restart_node(docker_id):
 def reset_node(ip, port, docker_id):
     try:
         time.sleep(random.uniform(0.01, 0.05))
-        requests.get("http://{}:{}/reset_node".format(ip, port), timeout=30)
+        session.get("http://{}:{}/reset_node".format(ip, port), timeout=30)
     except Exception as e:
         print("An error occurred while sending the request: {}".format(e))
         restart_node(docker_id)
@@ -182,7 +190,7 @@ def delete_all_nodes():
         node.remove(force=True)
     return "OK"
 
-@monitoring_priomon.route('/restart_all', methods=['GET'])
+# not a route — called internally by the experiment loop, needs a run object
 def restart_all_nodes(run):
     start = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=run.node_count) as executor:
@@ -194,10 +202,10 @@ def start_node(index, run, database_address, monitoring_address, ip):
     to_send = {"node_list": run.node_list, "target_count": run.target_count, "gossip_rate": run.gossip_rate,
                "database_address": database_address, "monitoring_address": monitoring_address,
                "node_ip": run.node_list[index]["ip"], "is_send_data_back": experiment.is_send_data_back,
-               "push_mode": experiment.push_mode, "client_port": "4000"}
+               "push_mode": experiment.push_mode, "client_port": parser.get('PriomonParam', 'client_port')}
     try:
         time.sleep(0.01)
-        requests.post("http://{}:{}/start_node".format(ip, run.node_list[index]["port"]), json=to_send)
+        session.post("http://{}:{}/start_node".format(ip, run.node_list[index]["port"]), json=to_send)
     except Exception as e:
         print("Node not started: {}".format(e))
         start_node(index, run, database_address, monitoring_address, ip)
@@ -367,14 +375,14 @@ def push_data_to_database():
 def update_ic():
     client_ip = request.args['ip']
     client_port = request.args['port']
-    experiment.runs[-1].ip_per_ic[client_ip + ":" + client_port] = True
-    if len(experiment.runs[-1].ip_per_ic) == experiment.runs[-1].node_count:
-        run_converged(experiment.runs[-1])
+    with run_lock:
+        experiment.runs[-1].ip_per_ic[client_ip + ":" + client_port] = True
+        if len(experiment.runs[-1].ip_per_ic) == experiment.runs[-1].node_count:
+            run_converged(experiment.runs[-1])
     return "OK"
 
 @monitoring_priomon.route('/receive_node_data', methods=['POST'])
 def update_data_entries_per_ip():
-    global experiment
     if not experiment:
         print("No experiment running, but a gossip node is trying to send data")
         return "NOK"
@@ -392,9 +400,10 @@ def update_data_entries_per_ip():
     ic = len(data_stored_in_node)
     bytes_of_data = len(json.dumps(data_stored_in_node).encode('utf-8'))
 
-    experiment.runs[-1].convergence_round = max(experiment.runs[-1].convergence_round, int(round))
-    experiment.runs[-1].message_count += 1
-    experiment.runs[-1].data_entries_per_ip[client_ip + ":" + client_port] = data_stored_in_node
+    with run_lock:
+        experiment.runs[-1].convergence_round = max(experiment.runs[-1].convergence_round, int(round))
+        experiment.runs[-1].message_count += 1
+        experiment.runs[-1].data_entries_per_ip[client_ip + ":" + client_port] = data_stored_in_node
     if not experiment.runs[-1].is_converged:
         if int(nd) > experiment.runs[-1].node_count:
             nd = experiment.runs[-1].node_count
@@ -428,9 +437,9 @@ def update_data_entries_per_ip():
             for metric_type, was_sent in node_data['metric_sent_flags'].items():
                 # Get metric value if available
                 metric_value = None
-                if 'appSate' in node_data and metric_type in node_data['appSate']:
+                if 'appState' in node_data and metric_type in node_data['appState']:
                     try:
-                        metric_value = float(node_data['appSate'][metric_type])
+                        metric_value = float(node_data['appState'][metric_type])
                     except (ValueError, TypeError):
                         pass
             
@@ -476,7 +485,6 @@ def print_experiment():
 def start_priomon():
     server_ip = socket.gethostbyname(socket.gethostname())
     print("Server IP: {}".format(server_ip))
-    global experiment
     prepare_experiment(server_ip)
     for node_count in experiment.node_count_range:
         new_target_count_range = get_target_count(node_count, experiment.target_count_range)
@@ -498,21 +506,7 @@ def start_priomon():
     return "OK - Experiment finished"
 
 def create_and_start_priomon_node(node_number, node_list, target_count, gossip_rate):    
-    # metric priority configuration
-    node_data = {
-        "metric_priorities": {
-            "cpu": int(parser.get('MetricPriorities', 'cpu_priority', fallback=1)),
-            "memory": int(parser.get('MetricPriorities', 'memory_priority', fallback=5)),
-            "network": int(parser.get('MetricPriorities', 'network_priority', fallback=5)),
-            "storage": int(parser.get('MetricPriorities', 'storage_priority', fallback=10))
-        },
-        "metric_deltas": {
-            "cpu": float(parser.get('MetricDeltas', 'cpu_delta', fallback=5.0)),
-            "memory": float(parser.get('MetricDeltas', 'memory_delta', fallback=7.0)),
-            "network": float(parser.get('MetricDeltas', 'network_delta', fallback=15.0)),
-            "storage": float(parser.get('MetricDeltas', 'storage_delta', fallback=10.0))
-        }
-    }
-    
+    # metric priority configuration is currently handled directly in the spawned nodes
+    pass
 if __name__ == "__main__":
-    monitoring_priomon.run(host='0.0.0.0', port=4000, debug=False, threaded=True)
+    monitoring_priomon.run(host='0.0.0.0', port=parser.getint('PriomonParam', 'client_port'), debug=False, threaded=True)

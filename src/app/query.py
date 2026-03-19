@@ -2,6 +2,9 @@ import random
 import time
 import requests
 
+# max number of quorum attempts before we give up
+MAX_QUERY_RETRIES = 30
+
 def query(node_list, quorum_size, target_node_ip, target_node_port, docker_ip):
     def build_url(node, path):
         host = docker_ip if docker_ip else node["ip"]
@@ -9,7 +12,7 @@ def query(node_list, quorum_size, target_node_ip, target_node_port, docker_ip):
 
     target_key = f"{target_node_ip}:{target_node_port}"
 
-    while True:
+    for attempt in range(MAX_QUERY_RETRIES):
         # 1. Pick a random quorum
         random_nodes = random.sample(node_list, quorum_size)
 
@@ -24,9 +27,6 @@ def query(node_list, quorum_size, target_node_ip, target_node_port, docker_ip):
                 resp.raise_for_status()
                 data = resp.json()[target_key]
                 metadatas[f"{node['ip']}:{node['port']}"] = data
-
-                # (Optional) quick debug
-                # print(data["counter"])
             except Exception as e:
                 print(f"Node {node['ip']}:{node['port']} not responding: {e}")
 
@@ -48,3 +48,9 @@ def query(node_list, quorum_size, target_node_ip, target_node_port, docker_ip):
                     result = data_resp.json()[target_key]
                     print(f"Query result: {result}")
                     return total_messages, result
+
+        # small backoff before next attempt
+        time.sleep(0.5)
+
+    # if we get here, quorum was never reached
+    raise RuntimeError(f"Query failed: could not reach quorum consensus after {MAX_QUERY_RETRIES} attempts")

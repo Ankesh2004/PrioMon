@@ -1,14 +1,10 @@
-import os
-import random
 import time
 import psutil
 import requests
 from singleton import Singleton
 import logging
-import hashlib
-import json
 import secrets
-import math
+from utility import mk_digest
 
 logger = logging.getLogger("demon.metrics")
 
@@ -86,7 +82,7 @@ def get_new_data():
             "failureCount": node.failure_counter,
             "failureList": node.failure_list,
             "nodeAlive": node.is_alive},
-        "appSate": app_state,
+        "appState": app_state,
         "nfState": {},
         "metric_sent_flags": metric_flags
     }
@@ -163,6 +159,7 @@ class Node:
         self.counter_thread = None
         self.data_flow_per_round = None
         self.session_to_monitoring = requests.Session()
+        self.gossip_session = requests.Session()
         self.push_mode = None
         self.is_send_data_back = None
         self.metric_last_sent = {}
@@ -273,8 +270,8 @@ class Node:
                 self.metric_last_sent[metric] = self.cycle
             return filtered_data
         
-        if "appSate" in filtered_data:
-            app_state = filtered_data["appSate"].copy()
+        if "appState" in filtered_data:
+            app_state = filtered_data["appState"].copy()
             for metric, priority in METRIC_PRIORITIES.items():
                 last_sent = self.metric_last_sent.get(metric, 0)
                 if (self.cycle - last_sent) < priority:
@@ -285,7 +282,7 @@ class Node:
                     # Update last sent time for metrics being sent
                     self.metric_last_sent[metric] = self.cycle
             
-            filtered_data["appSate"] = app_state
+            filtered_data["appState"] = app_state
         
         return filtered_data
 
@@ -305,15 +302,15 @@ class Node:
     def send_to_node(self, n, new_time_key):
         data = self.prepare_metadata_and_own_fresh_data(new_time_key)
         try:
-            r_metadata_and_updated = requests.post(
+            r_metadata_and_updated = self.gossip_session.post(
                 'http://' + n["ip"] + ':' + '5000' + '/receive_metadata',
-                json=data)
+                json=data, timeout=5)
 
             requested_keys = r_metadata_and_updated.json()['requested_keys']
             requested_data = self.prepare_requested_data(new_time_key, requested_keys)
-            response = requests.get(
+            response = self.gossip_session.get(
                 'http://' + n["ip"] + ':' + '5000' + '/receive_message?inc_round={}'.format(self.cycle),
-                json=requested_data)
+                json=requested_data, timeout=5)
             self.update_own_data(r_metadata_and_updated.json()['updates'], new_time_key)
             if response.status_code == 500:
                 self.update_failure_data(new_time_key, n)
@@ -336,7 +333,9 @@ class Node:
         pass
 
     def delete_node_from_nodelist(self, key_to_delete):
-        self.node_list.pop(key_to_delete)
+        # node_list is a list of dicts with 'ip' and 'port', not a dict
+        self.node_list = [n for n in self.node_list
+                          if n["ip"] + ":" + n["port"] != key_to_delete]
 
     def reset_failure_data(self, new_time_key, ip_key):
         if ip_key in self.data[new_time_key]:

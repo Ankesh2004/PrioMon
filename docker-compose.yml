@@ -1,0 +1,22 @@
+version: '3.8'
+
+# sets up the docker network and builds the node image
+# the experiment orchestrator (monitoring.py) spawns containers at runtime,
+# but the network and image need to exist first
+
+services:
+  # this service only exists to build the priomonv1 image
+  # the actual nodes are spawned dynamically by monitoring.py
+  priomon-builder:
+    build:
+      context: ./src/app
+      dockerfile: Dockerfile
+    image: priomonv1
+    # don't actually run this container, just build the image
+    entrypoint: ["echo", "Image built successfully"]
+
+networks:
+  # the 'test' network that monitoring.py expects
+  default:
+    name: test
+    driver: bridge

@@ -1,9 +1,7 @@
-import signal
 import time
 
-import requests
 from flask import Flask, request
-from node import Node
+from node import Node, METRIC_PRIORITIES, METRIC_DELTAS
 import threading
 import logging
 import json
@@ -27,6 +25,8 @@ def get_metadata():
         # reset_node()
         return "Dead Node", 500
     node = Node.instance()
+    if not node.data:
+        return json.dumps({})
     latest_entry = max(node.data.keys(), key=int)
     metadata = {}
     for key in node.data[latest_entry]:
@@ -98,7 +98,10 @@ def reset_node():
     node.is_alive = False
     node.client_thread.join()
     node.counter_thread.join()
-    node.set_params(None, None, 0, None, {}, False, 0, 0, None, None, None, None, {}, push_mode=0)
+    node.set_params(None, None, 0, None, {}, False, 0, 0, None, None,
+                    is_send_data_back=None, client_thread=None,
+                    counter_thread=None, data_flow_per_round={},
+                    push_mode=0, client_port=None)
     return "OK"
 
 
@@ -132,14 +135,14 @@ def compare_and_update_node_data(inc_data):
         if key in node.data[latest_entry] and key in new_data:
 
             # Handle partial metric updates - preserve existing metrics if not in incoming data
-            if 'appSate' in new_data[key] and 'appSate' in node.data[latest_entry][key]:
+            if 'appState' in new_data[key] and 'appState' in node.data[latest_entry][key]:
                 # Get lists of metrics
-                existing_metrics = set(node.data[latest_entry][key]['appSate'].keys())
-                incoming_metrics = set(new_data[key]['appSate'].keys())
+                existing_metrics = set(node.data[latest_entry][key]['appState'].keys())
+                incoming_metrics = set(new_data[key]['appState'].keys())
                 
                 # For any metric in existing but not in incoming, copy from existing
                 for metric in existing_metrics - incoming_metrics:
-                    new_data[key]['appSate'][metric] = node.data[latest_entry][key]['appSate'][metric]
+                    new_data[key]['appState'][metric] = node.data[latest_entry][key]['appState'][metric]
             
             if 'metric_sent_flags' in new_data[key]:
                 sent_count = sum(1 for v in new_data[key]['metric_sent_flags'].values() if v)
@@ -221,13 +224,11 @@ def start_node():
     client_thread.start()
     counter_thread.start()
 
-    # Configure metric priorities and deltas if provided
+    # configure metric priorities and deltas if the orchestrator sent them
     if 'metric_priorities' in init_data:
-        global METRIC_PRIORITIES
         METRIC_PRIORITIES.update(init_data['metric_priorities'])
     
     if 'metric_deltas' in init_data:
-        global METRIC_DELTAS
         METRIC_DELTAS.update(init_data['metric_deltas'])
 
     return "OK"

@@ -1,0 +1,8 @@
+*.png
+*.db
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyi
