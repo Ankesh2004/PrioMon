@@ -1,0 +1,53 @@
+# PrioMon Standalone Node Configuration
+# copy this and fill in for each node you want to run
+
+node:
+  # this node's bind address — 0.0.0.0 to listen on all interfaces
+  host: "0.0.0.0"
+  port: 5000
+
+gossip:
+  # how many peers to gossip to each cycle
+  target_count: 2
+  # seconds between gossip rounds
+  rate: 0.5
+
+# seed nodes to contact on startup for peer discovery
+# at least one seed should be reachable, otherwise this node starts alone
+seeds:
+  - "192.168.1.10:5000"
+  # - "192.168.1.11:5000"
+
+# priority filtering — which metrics matter more
+metric_priorities:
+  cpu: 1        # every round
+  memory: 5     # every 5 rounds
+  network: 5    # every 5 rounds
+  storage: 10   # every 10 rounds
+
+# delta thresholds — minimum % change to force an early update
+metric_deltas:
+  cpu: 5.0
+  memory: 7.0
+  network: 15.0
+  storage: 10.0
+
+# where to persist peer state across restarts
+state_file: "peer_state.json"
+
+# local metric history — persists cluster metrics to SQLite on this node
+metric_history:
+  # how often to snapshot gossip state to disk (seconds)
+  snapshot_interval: 5
+  # how long to keep history (seconds, default 1 hour)
+  retention_seconds: 3600
+
+# optional — set to a monitoring server address if you want centralized logging
+# leave blank for fully decentralized mode
+monitoring:
+  address: ""
+  port: 4000
+  send_data_back: false
+
+# push mode — batch push old data to monitoring server periodically
+push_mode: false

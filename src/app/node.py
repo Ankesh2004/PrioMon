@@ -1,4 +1,6 @@
 import time
+import json
+import os
 import psutil
 import requests
 from singleton import Singleton
@@ -163,6 +165,7 @@ class Node:
         self.push_mode = None
         self.is_send_data_back = None
         self.metric_last_sent = {}
+        self._state_save_thread = None
 
     def set_params(self, ip, port, cycle, node_list, data, is_alive, gossip_counter, failure_counter,
                    monitoring_address, database_address, is_send_data_back, client_thread, counter_thread, data_flow_per_round, push_mode, client_port):
@@ -185,8 +188,42 @@ class Node:
 
     def get_random_nodes(self, node_list, target_count):
         filtered_nodes = [node for node in node_list if node['ip'] != self.ip]
+        # in case we have fewer peers than target_count, just use what we have
+        if len(filtered_nodes) < target_count:
+            return filtered_nodes
         return secrets.SystemRandom().sample(filtered_nodes, target_count)
-    
+
+    # ---- peer state persistence ----
+
+    def save_peer_state(self, state_file=None):
+        """Save current peer list to disk so we survive restarts."""
+        if state_file is None:
+            state_file = os.environ.get("PRIOMON_STATE_FILE", "peer_state.json")
+        if not self.node_list:
+            return
+        try:
+            with open(state_file, "w") as f:
+                json.dump({
+                    "peers": self.node_list,
+                    "saved_at": time.time()
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save peer state: {e}")
+
+    def start_state_saver(self, interval=30):
+        """
+        Background thread that periodically saves peer state.
+        Runs every `interval` seconds while the node is alive.
+        """
+        import threading
+        def _saver_loop():
+            while self.is_alive:
+                time.sleep(interval)
+                self.save_peer_state()
+                logger.debug(f"Saved peer state ({len(self.node_list or [])} peers)")
+        self._state_save_thread = threading.Thread(target=_saver_loop, daemon=True)
+        self._state_save_thread.start()
+
     def start_gossip_counter(self):
         while self.is_alive:
             self.gossip_counter += 1
@@ -275,11 +312,11 @@ class Node:
             for metric, priority in METRIC_PRIORITIES.items():
                 last_sent = self.metric_last_sent.get(metric, 0)
                 if (self.cycle - last_sent) < priority:
-                    # Remove metrics that don't need to be sent this round
-                    if metric in app_state:
-                        app_state[metric] = "not_updated"
+                    # drop it entirely so the receiver's merge logic keeps
+                    # whatever real value it already has for this metric
+                    app_state.pop(metric, None)
                 else:
-                    # Update last sent time for metrics being sent
+                    # this metric is due — send it and update the timer
                     self.metric_last_sent[metric] = self.cycle
             
             filtered_data["appState"] = app_state

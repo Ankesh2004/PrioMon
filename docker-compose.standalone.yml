@@ -1,0 +1,61 @@
+# Example: run a 3-node PrioMon cluster in standalone mode
+# No orchestrator needed — nodes discover each other via seeds
+#
+# Usage:
+#   docker-compose -f docker-compose.standalone.yml up --build
+#
+# Each node finds peers through seed addresses and starts gossiping automatically.
+# Node 1 starts first (as the seed), then nodes 2 and 3 join it.
+
+version: '3.8'
+
+services:
+  node1:
+    build:
+      context: ./src/app
+      dockerfile: Dockerfile
+    image: priomonv1
+    environment:
+      - PRIOMON_STANDALONE=1
+      - PRIOMON_IP=node1
+      - PRIOMON_CONFIG=/mini/configs/node1.yaml
+    volumes:
+      - node1_state:/mini/state
+      - ./standalone_configs:/mini/configs:ro
+    ports:
+      - "5001:5000"
+    networks:
+      - priomon_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  node2:
+    build:
+      context: ./src/app
+      dockerfile: Dockerfile
+    image: priomonv1
+    environment:
+      - PRIOMON_STANDALONE=1
+      - PRIOMON_IP=node2
+      - PRIOMON_CONFIG=/mini/configs/node2.yaml
+    volumes:
+      - node2_state:/mini/state
+      - ./standalone_configs:/mini/configs:ro
+    ports:
+      - "5002:5000"
+    networks:
+      - priomon_net
+    depends_on:
+      node1:
+        condition: service_healthy
+
+volumes:
+  node1_state:
+  node2_state:
+
+networks:
+  priomon_net:
+    driver: bridge

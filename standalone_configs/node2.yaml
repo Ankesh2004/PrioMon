@@ -1,0 +1,34 @@
+# Node 2 — joins by contacting node1 as seed
+
+node:
+  host: "0.0.0.0"
+  port: 5000
+
+gossip:
+  target_count: 1
+  rate: 0.5
+
+# point to node1 as the seed to discover the cluster
+seeds:
+  - "node1:5000"
+
+metric_priorities:
+  cpu: 1
+  memory: 5
+  network: 5
+  storage: 10
+
+metric_deltas:
+  cpu: 5.0
+  memory: 7.0
+  network: 15.0
+  storage: 10.0
+
+state_file: "/mini/state/peer_state.json"
+
+monitoring:
+  address: ""
+  port: 4000
+  send_data_back: false
+
+push_mode: false
