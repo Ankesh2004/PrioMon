@@ -42,6 +42,14 @@ metric_history:
   # how long to keep history (seconds, default 1 hour)
   retention_seconds: 3600
 
+# mTLS — encrypts all gossip traffic and ensures only authorized nodes can join
+# set enabled: true and provide cert paths to activate
+tls:
+  enabled: false
+  ca_cert: "/mini/certs/ca.crt"
+  node_cert: "/mini/certs/node1.crt"
+  node_key: "/mini/certs/node1.key"
+
 # optional — set to a monitoring server address if you want centralized logging
 # leave blank for fully decentralized mode
 monitoring:

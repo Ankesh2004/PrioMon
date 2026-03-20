@@ -1,173 +1,215 @@
-# PrioMon: Priority-Based Distributed Monitoring
+# PrioMon — Priority-Based Distributed Monitoring
 
-PrioMon is a high-performance distributed monitoring system that utilizes a gossip protocol to propagate system metrics (CPU, Memory, Network, Storage) across a cluster of nodes. It features a unique **priority-based bandwidth-saving mechanism** that intelligently filters metrics based on their importance and the magnitude of data changes.
+PrioMon is a distributed monitoring system built around a **gossip protocol** with a novel **priority-based bandwidth-saving engine**. It propagates system metrics (CPU, Memory, Network, Storage) across a cluster of nodes — without a central broker, without polling, and without wasting bandwidth on updates nobody cares about.
 
-##  Key Features
+This repo contains two distinct systems that share the same gossip core:
 
-- **Gossip Protocol Propagation**: Efficient data dissemination without a single point of failure.
-- **Priority Filtering**: Reduces bandwidth usage by up to 100x by prioritizing critical status updates and skipping redundant ones.
-- **Node Resilience**: Automatic failure detection and handling of dead nodes.
-- **SSD Optimized**: Uses SQLite WAL (Write-Ahead Logging) to protect your hardware during intensive high-frequency simulations.
-- **Integrated Analytics**: Built-in plotting tools to visualize convergence time, success rates, and bandwidth savings.
-- **Standalone Mode**: Run nodes independently on real machines — no orchestrator needed. Nodes discover each other via seed addresses.
-- **Peer Persistence**: Nodes save their peer list to disk so they survive restarts without losing cluster membership.
-- **Cluster Metrics API**: Clean JSON endpoints to query any node's view of the cluster (`/cluster/metrics`).
-- **Quorum Queries**: Verify a node's data against multiple peers with consensus-based verification (`/cluster/query/<target>`).
-- **Metric History**: Each node persists a rolling window of cluster metrics to local SQLite for historical queries (`/cluster/history`).
+| Mode | Location | Audience |
+|---|---|---|
+| **🧪 Experiment / Simulation** | `experiments/` | Researchers — benchmark convergence, bandwidth, resilience |
+| **🌍 Real-World / Standalone** | `src/app/` | Engineers — deploy actual nodes on machines/containers |
 
-##  Project Structure
+---
+
+## How the Core Works (Both Modes)
+
+### Gossip Protocol
+
+Every node runs a timed gossip loop. On each cycle, a node:
+1. Reads its own system metrics (CPU, memory, network, storage via `psutil`)
+2. Applies **priority filtering** to decide which metrics to include this round
+3. Picks `N` random peers from its peer list
+4. Does a **two-phase gossip exchange** with each peer:
+   - Phase 1: Sends its own data + metadata (counter + digest) for all other nodes it knows about → receives back what the peer needs
+   - Phase 2: Sends the requested data; receives the peer's updates
+
+This is a hybrid **push-pull gossip** — more efficient than pure push because data flows in both directions per connection.
+
+### Priority Filtering (The Key Innovation)
+
+Metrics are not all equal. CPU changing by 0.1% is noise; a spike from 10% to 90% matters. PrioMon applies two complementary filters before a metric gets included in a gossip payload:
+
+**1. Round-Based Priority (`METRIC_PRIORITIES`)**
+```
+cpu:     priority = 1   → sent every single round
+memory:  priority = 5   → sent at most every 5 rounds
+network: priority = 5   → sent at most every 5 rounds
+storage: priority = 10  → sent at most every 10 rounds
+```
+
+**2. Delta Threshold (`METRIC_DELTAS`)**
+Even if a metric isn't due by schedule, it gets sent immediately if it changes by more than:
+```
+cpu:     5%   change → immediate send
+memory:  7%   change → immediate send
+network: 15%  change → immediate send
+storage: 10%  change → immediate send
+```
+
+If a metric is filtered out, it's **dropped entirely** from the gossip payload (not sent as `null`). The receiving node's merge logic preserves its last known value for that metric. This avoids false overwriting with stale data.
+
+### Failure Detection (SWIM-style)
+
+When a node can't reach a peer, it:
+1. Adds itself to that peer's `failureList` in its local state
+2. Gossips this suspicion to others → state spreads
+3. If **3 or more distinct nodes** report the same peer as unreachable → it's declared **DEAD**
+4. Dead nodes are removed from the active peer list but their tombstone stays in gossip data so the status propagates
+
+---
+
+## Project Structure
 
 ```text
 PrioMon/
-├── src/                    # Core Gossip Engine
-│   ├── app/                # Dockerized node logic
-│   │   ├── priomon.py      # Flask server (gossip + cluster API + standalone startup)
-│   │   ├── node.py         # Node state, metric collection, priority filtering
-│   │   ├── discovery.py    # Seed-based peer discovery + state persistence
-│   │   ├── metric_store.py # Local SQLite metric history (rolling window)
-│   │   ├── standalone.py   # CLI entry point for standalone mode
-│   │   ├── node_config.yaml # Template config for standalone nodes
-│   │   └── query.py        # Quorum-based query logic
-│   └── query_client.py     # Client-side query bridge
-├── experiments/            # Simulation Orchestration & Analysis
-│   ├── monitoring.py       # Central experiment runner & monitoring server
-│   ├── plot.py             # Analytics visualization tool
-│   └── config.ini          # Simulation parameters
-├── standalone_configs/     # Example configs for a 3-node standalone cluster
-├── docker-compose.yml              # Orchestrated mode (monitoring.py spawns nodes)
-├── docker-compose.standalone.yml   # Standalone mode (nodes self-organize)
-└── requirements.txt        # Orchestrator dependencies (Python)
+│
+├── src/app/                          ← REAL-WORLD NODE (standalone mode)
+│   ├── standalone.py                 # CLI entry point: python standalone.py --config ...
+│   ├── priomon.py                    # Flask server — gossip API + cluster API + startup
+│   ├── node.py                       # Node state machine, metric collection, priority engine
+│   ├── discovery.py                  # Seed-based peer discovery + disk persistence
+│   ├── metric_store.py               # Rolling SQLite history of cluster metrics
+│   ├── tls_utils.py                  # mTLS config — cert loading, SSL context, session setup
+│   ├── node_config.yaml              # Template config for a standalone node
+│   ├── singleton.py                  # Singleton pattern for Node instance
+│   ├── utility.py                    # mk_digest() — SHA-256 gossip digest
+│   ├── query.py                      # Quorum query logic
+│   └── Dockerfile                    # Container image for a node
+│
+├── experiments/                      ← SIMULATION / RESEARCH MODE
+│   ├── monitoring.py                 # Experiment orchestrator + monitoring Flask server
+│   ├── connector_db.py               # Database layer for experiment data
+│   ├── plot.py                       # Matplotlib analytics visualizations
+│   ├── config.ini                    # Experiment parameters
+│   └── README.md                     # Detailed experiment guide (this dir)
+│
+├── standalone_configs/               ← Example configs for a 2-node standalone cluster
+│   ├── node1.yaml                    # Seed node config (no seeds, IS the seed)
+│   └── node2.yaml                    # Joiner node config (seeds: [node1:5000])
+│
+├── scripts/
+│   └── generate_certs.py             # One-shot mTLS certificate generator
+│
+├── certs/                            # Pre-generated certs for the 2-node example
+│   ├── ca.crt / ca.key
+│   ├── node1.crt / node1.key
+│   └── node2.crt / node2.key
+│
+├── docker-compose.yml                # Orchestrated experiment mode (builds priomonv1 image)
+├── docker-compose.standalone.yml     # Standalone 2-node cluster with mTLS
+├── requirements.txt                  # Python deps for the experiment orchestrator
+└── notes.md                          # Real-world roadmap and future plans
 ```
 
-##  Quick Start
+---
 
-### Option A: Orchestrated Simulation (for benchmarking / research)
+## 🧪 Mode 1: Experiment / Simulation
 
-1.  **Prerequisites**: Python 3.9+, Docker & Docker Compose
-2.  **Build the Node Image**:
-    ```powershell
-    docker-compose up --build -d
-    ```
-3.  **Install orchestrator deps & start**:
-    ```powershell
-    pip install -r requirements.txt
-    python experiments/monitoring.py
-    ```
-4.  **Trigger the Experiment**: Open `http://localhost:4000/start`
+> **→ Full guide: [`experiments/README.md`](experiments/README.md)**
 
-### Option B: Standalone Cluster (for real-world use)
+This mode runs a **controlled, automated simulation** where a central `monitoring.py` script:
+- Spawns Docker containers as nodes using the Docker SDK
+- Feeds each node its complete peer list and parameters
+- Collects per-round gossip data from every node
+- Saves everything to `PrioMonDB.db` for later analysis
 
-No orchestrator needed — each node runs independently and finds peers via seeds.
-
-1.  **Build the image**:
-    ```powershell
-    docker-compose -f docker-compose.standalone.yml build
-    ```
-2.  **Start the cluster**:
-    ```powershell
-    docker-compose -f docker-compose.standalone.yml up
-    ```
-    Node 1 starts as the seed. Nodes 2 & 3 join by contacting it.
-
-3.  **Check health**: `curl http://localhost:5001/health`
-4.  **View cluster metrics**: `curl http://localhost:5001/cluster/metrics`
-5.  **Query a specific node (verified)**: `curl http://localhost:5001/cluster/query/172.18.0.2:5000`
-6.  **View metric history**: `curl http://localhost:5001/cluster/history?minutes=5`
-
-### Running on bare metal (no Docker)
-
-```bash
-cd src/app
-pip install -r requirements.txt
-python standalone.py --config /path/to/your_config.yaml
-```
-
-### Visualizing Results (Orchestrated mode)
-After the simulation finishes:
+**Quick start:**
 ```powershell
+# 1. Build the node Docker image
+docker-compose up --build -d
+
+# 2. Install orchestrator dependencies
+pip install -r requirements.txt
+
+# 3. Start the monitoring server
+python experiments/monitoring.py
+
+# 4. Trigger the experiment via HTTP
+curl http://localhost:4000/start
+
+# 5. After it finishes, visualize results
 python experiments/plot.py
 ```
 
-##  Configuration
+---
 
-### Orchestrated mode
-Tweak parameters in `experiments/config.ini`.
+## 🌍 Mode 2: Real-World / Standalone
 
-### Standalone mode
-Copy `src/app/node_config.yaml` and customize:
-- **seeds**: IP:port of nodes to contact on startup
-- **metric_priorities**: how often each metric type gets sent (1=every round, 10=every 10th round)
-- **metric_deltas**: minimum % change to force an early update
-- **state_file**: where to persist the peer list across restarts
-- **metric_history.snapshot_interval**: how often to save metrics to SQLite (seconds)
-- **metric_history.retention_seconds**: how long to keep historical data
+> **→ Full guide: [`src/app/README.md`](src/app/README.md)**
 
-##  API Endpoints
+This mode runs **actual autonomous nodes** that discover each other, persist their state, encrypt their gossip with mTLS, and expose clean observability APIs. No orchestrator. No central controller. Just nodes.
 
-### Cluster Operations
+**Quick start (Docker, 2-node cluster with mTLS):**
+```powershell
+docker-compose -f docker-compose.standalone.yml up --build
+```
+
+**Quick start (bare metal, no Docker):**
+```powershell
+# Node 1 (seed)
+cd src/app
+pip install -r requirements.txt
+python standalone.py --config ../../standalone_configs/node1.yaml
+
+# Node 2 (on another terminal / machine)
+python standalone.py --config ../../standalone_configs/node2.yaml
+```
+
+**Check that it's working:**
+```powershell
+# Health check
+curl http://localhost:5001/health
+
+# See what every node thinks the cluster looks like
+curl http://localhost:5001/cluster/metrics
+```
+
+---
+
+## Key Differences at a Glance
+
+| Aspect | 🧪 Experiment Mode | 🌍 Standalone Mode |
+|---|---|---|
+| **Startup** | `monitoring.py` bootstraps everything | Each node starts itself via `standalone.py` |
+| **Peer Discovery** | Static list pushed by orchestrator | Dynamic — seeds → `/peers` → `/join` |
+| **Identity** | IP:port only, ephemeral | Persistent UUID (`.node_id` file survives restart) |
+| **Peer Persistence** | None — orchestrator controls everything | `peer_state.json` saved to disk every 30s |
+| **Security** | Plaintext HTTP (local Docker bridge) | mTLS — all gossip encrypted + authenticated |
+| **Metric History** | Central `PrioMonDB.db` per experiment | Per-node `metric_history.db` with rolling retention |
+| **Failure Model** | Containers stopped by orchestrator | SWIM-style suspect → dead via gossip |
+| **Observability API** | Raw data endpoints only | `/cluster/metrics`, `/health`, `/cluster/history` |
+| **Use Case** | Benchmarking, academic research | IoT, Kubernetes sidecars, mesh networks |
+
+---
+
+## API Reference (Both Modes)
+
+### Gossip Endpoints (Internal — node-to-node)
 | Endpoint | Method | Description |
 |---|---|---|
-| `/cluster/metrics` | GET | Clean JSON of all nodes' current metrics |
-| `/cluster/metrics/<ip:port>` | GET | Metrics for a specific node |
-| `/cluster/query/<ip:port>` | GET | Quorum-verified query (consensus check across peers) |
-| `/cluster/history` | GET | Historical metrics from local SQLite (`?node=...&minutes=10&limit=200`) |
-| `/cluster/history/latest` | GET | Most recent persisted metrics for each node |
+| `/receive_metadata` | POST | Phase 1 of gossip exchange — metadata comparison |
+| `/receive_message` | GET | Phase 2 of gossip exchange — data transfer |
+| `/metadata` | GET | Returns counter + digest per node (for quorum queries) |
 
 ### Node Management
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check (status, peer count, cycle) |
-| `/peers` | GET | Returns the current peer list |
-| `/join` | POST | Register a new peer `{"ip": "...", "port": "..."}` |
-| `/metrics_priority_stats` | GET | Priority filtering statistics |
+| `/health` | GET | Liveness check: `{status, nodeAlive, node_id, peers, cycle}` |
+| `/peers` | GET | Returns this node's current peer list |
+| `/join` | POST | Register a new peer: `{"ip": "...", "port": "..."}` |
+| `/metrics_priority_stats` | GET | Priority filtering stats + bandwidth savings |
 
-### Raw Gossip Data
+### Cluster Observability (Standalone mode)
 | Endpoint | Method | Description |
 |---|---|---|
-| `/get_recent_data_from_node` | GET | Latest raw gossip snapshot |
-| `/get_data_from_node` | GET | Full historical gossip data |
-| `/metadata` | GET | Counter + digest per node (for quorum) |
+| `/cluster/metrics` | GET | Clean JSON view of all nodes' latest metrics |
+| `/cluster/metrics/<ip:port>` | GET | Metrics for one specific node |
+| `/cluster/query/<ip:port>` | GET | Quorum-verified consensus query for a target node |
+| `/cluster/history` | GET | Historical metrics from SQLite (`?node=&minutes=&limit=`) |
+| `/cluster/history/latest` | GET | Most recent persisted snapshot per node |
 
-## Example: Querying Cluster Metrics
-
-```bash
-# clean cluster view from node 1
-curl http://localhost:5001/cluster/metrics | python -m json.tool
-
-# response:
-{
-  "timestamp": 1710912345.123,
-  "reporting_node": "172.18.0.2:5000",
-  "total_nodes": 3,
-  "cycle": 42,
-  "nodes": {
-    "172.18.0.2:5000": {
-      "cpu": 23.5,
-      "memory": 67.8,
-      "network": 1234567890.0,
-      "storage": 50000000000.0,
-      "alive": true,
-      "cycle": "42"
-    },
-    "172.18.0.3:5000": { ... },
-    "172.18.0.4:5000": { ... }
-  }
-}
-```
-
-```bash
-# quorum-verified query about a specific node
-curl "http://localhost:5001/cluster/query/172.18.0.3:5000?quorum_size=2"
-
-# response:
-{
-  "status": "verified",
-  "target": "172.18.0.3:5000",
-  "quorum_size": 2,
-  "attempts": 1,
-  "consensus": { "counter": "42", "digest": "abc123..." },
-  "metrics": { "cpu": 15.2, "memory": 45.1, ... },
-  "health": { "alive": true, "failure_count": 0 },
-  "verified_by": ["172.18.0.2:5000", "172.18.0.4:5000"]
-}
-```
+### Raw Data (Mostly for debugging)
+| Endpoint | Method | Description |
+|---|---|---|
+| `/get_recent_data_from_node` | GET | Latest raw gossip snapshot (all peers' data) |
+| `/get_data_from_node` | GET | Full multi-round gossip history |

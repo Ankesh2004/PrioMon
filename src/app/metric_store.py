@@ -42,7 +42,7 @@ class MetricStore:
                 memory REAL,
                 network REAL,
                 storage REAL,
-                alive INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'alive',
                 cycle INTEGER,
                 gossip_counter TEXT
             )
@@ -70,16 +70,17 @@ class MetricStore:
             for node_key, metrics in cluster_data.items():
                 cursor.execute(
                     """INSERT INTO metric_snapshots 
-                       (timestamp, node_key, cpu, memory, network, storage, alive, cycle, gossip_counter)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (timestamp, node_key, node_id, cpu, memory, network, storage, status, cycle, gossip_counter)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         now,
                         node_key,
+                        metrics.get("node_id"),
                         metrics.get("cpu"),
                         metrics.get("memory"),
                         metrics.get("network"),
                         metrics.get("storage"),
-                        1 if metrics.get("alive", True) else 0,
+                        metrics.get("status", "alive"),
                         metrics.get("cycle"),
                         metrics.get("gossip_counter")
                     )
@@ -134,6 +135,7 @@ class MetricStore:
             result.append({
                 "timestamp": row["timestamp"],
                 "node_key": row["node_key"],
+                "node_id": row["node_id"],
                 "cpu": row["cpu"],
                 "memory": row["memory"],
                 "network": row["network"],
@@ -162,11 +164,11 @@ class MetricStore:
         result = {}
         for row in rows:
             result[row["node_key"]] = {
+                "node_id": row["node_id"],
                 "cpu": row["cpu"],
                 "memory": row["memory"],
-                "network": row["network"],
                 "storage": row["storage"],
-                "alive": bool(row["alive"]),
+                "status": row["status"],
                 "cycle": row["cycle"],
                 "last_seen": row["timestamp"]
             }
@@ -259,11 +261,16 @@ def extract_cluster_metrics(node_ref):
 
         # pull heartbeat/liveness info
         hb = node_data.get("hbState", {})
-        entry["alive"] = hb.get("nodeAlive", True)
+        
+        # default to alive if not set, otherwise use what's there
+        status = hb.get("status")
+        if not status:
+            status = "alive" if hb.get("nodeAlive", True) else "dead"
+        entry["status"] = status
 
-        # cycle and counter
         entry["cycle"] = node_data.get("cycle")
         entry["gossip_counter"] = node_data.get("counter")
+        entry["node_id"] = node_data.get("nodeState", {}).get("id", "")
 
         cluster[node_key] = entry
 

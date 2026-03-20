@@ -25,10 +25,46 @@ try:
 except ImportError:
     get_store = None  # metric persistence not available
 
+try:
+    from tls_utils import TLSConfig, load_tls_from_config, set_global_tls, get_global_tls
+except ImportError:
+    TLSConfig = None  # TLS module not available
+    load_tls_from_config = None
+
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("priomon")
 gossip = Flask(__name__)
 
+
+def _merge_incoming_peers(node, incoming_peers):
+    """
+    Merge peers from a gossip payload into our node_list.
+    This is how peer lists propagate through the network — if node3 joins
+    via node1, node2 will learn about node3 on its next gossip exchange.
+    """
+    if not incoming_peers or not node.node_list:
+        return
+
+    # build a set of known peer keys for fast lookup
+    known = {f"{p['ip']}:{p['port']}" for p in node.node_list}
+    added = 0
+
+    for peer in incoming_peers:
+        peer_key = f"{peer['ip']}:{peer['port']}"
+        if peer_key not in known:
+            node.node_list.append({"ip": peer["ip"], "port": str(peer["port"])})
+            known.add(peer_key)
+            added += 1
+            logger.info(f"Discovered new peer via gossip: {peer_key}")
+
+    # persist updated peer list if we found new ones
+    if added > 0:
+        try:
+            from discovery import save_state
+            state_file = os.environ.get("PRIOMON_STATE_FILE", "peer_state.json")
+            save_state(node.node_list, state_file)
+        except ImportError:
+            pass
 
 @gossip.route('/receive_message', methods=['GET'])
 def receive_message():
@@ -61,8 +97,12 @@ def compare_node_data_with_metadata(data):
     # to_send = {'metadata': metadata, key:own_recent_data}
     node = Node.instance()
     metadata = data['metadata']
-    sender_key = next(key for key in data if key != 'metadata')
+    # skip internal keys when finding the sender's data entry
+    sender_key = next(key for key in data if key not in ('metadata', '_peers'))
     sender_data = data[sender_key]
+
+    # merge any new peers the sender knows about into our own list
+    _merge_incoming_peers(node, data.get('_peers', []))
     if len(node.data) == 0:
         # node doesnt store any data yet
         return metadata.keys()
@@ -138,9 +178,7 @@ def compare_and_update_node_data(inc_data):
     node = Node.instance()
     new_time_key = node.gossip_counter
     latest_entry = max(node.data.keys(), key=int) if len(node.data) > 0 else new_time_key
-    new_data = inc_data
-    # new_data = inc_data['data']
-    # new_node_list = inc_data['node_list']
+    new_data = {k: v for k, v in inc_data.items() if k != '_peers'}
     all_keys = set().union(node.data[latest_entry].keys(), new_data.keys())
     inc_round = int(request.args.get('inc_round'))
     # received messages ['rm'] per round
@@ -225,8 +263,9 @@ def compare_and_update_node_data(inc_data):
     to_send = {'data': data_to_send_to_monitor, 'data_flow_per_round': node.data_flow_per_round[node.cycle]}
     # TODO: Session here
     if node.is_send_data_back == "1":
+        scheme = node._tls_scheme if hasattr(node, '_tls_scheme') else 'http'
         node.session_to_monitoring.post(
-            'http://{}:{}/receive_node_data?ip={}&port={}&round={}'.format(node.monitoring_address,node.client_port, node.ip,
+            '{}://{}:{}/receive_node_data?ip={}&port={}&round={}'.format(scheme, node.monitoring_address,node.client_port, node.ip,
                                                                              node.port,
                                                                              inc_round), json=to_send)
 
@@ -342,8 +381,22 @@ def join_cluster():
 def health_check():
     """Simple health endpoint for load balancers / liveness probes."""
     node = Node.instance()
+    
+    # Check if we have determined our own status in hbState, otherwise default to node.is_alive
+    try:
+        latest_key = max(node.data.keys(), key=int)
+        own_hb = node.data[latest_key].get(f"{node.ip}:{node.port}", {}).get("hbState", {})
+        status = own_hb.get("status")
+    except (ValueError, KeyError):
+        status = None
+        
+    if not status:
+        status = "alive" if node.is_alive else "dead"
+        
     return json.dumps({
-        "status": "alive" if node.is_alive else "dead",
+        "status": status,
+        "nodeAlive": node.is_alive,
+        "node_id": node.node_id or "unknown",
         "peers": len(node.node_list) if node.node_list else 0,
         "cycle": node.cycle or 0
     })
@@ -475,12 +528,15 @@ def cluster_query(target_key):
         total_messages = 0
 
         # ask each quorum member for their metadata about the target
+        tls_kwargs = get_global_tls().get_request_kwargs() if get_global_tls else {}
+        scheme = get_global_tls().scheme if get_global_tls else "http"
         for peer in quorum_nodes:
             total_messages += 1
             try:
                 resp = http_requests.get(
-                    f"http://{peer['ip']}:{peer['port']}/metadata",
-                    timeout=5
+                    f"{scheme}://{peer['ip']}:{peer['port']}/metadata",
+                    timeout=5,
+                    **tls_kwargs
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -502,8 +558,9 @@ def cluster_query(target_key):
                 fetch_peer = quorum_nodes[0]
                 try:
                     data_resp = http_requests.get(
-                        f"http://{fetch_peer['ip']}:{fetch_peer['port']}/get_recent_data_from_node",
-                        timeout=5
+                        f"{scheme}://{fetch_peer['ip']}:{fetch_peer['port']}/get_recent_data_from_node",
+                        timeout=5,
+                        **tls_kwargs
                     )
                     if data_resp.status_code == 200:
                         full_data = data_resp.json()
@@ -626,9 +683,11 @@ def _extract_metrics_fallback(node):
             "memory": _safe_float(app_state.get("memory")),
             "network": _safe_float(app_state.get("network")),
             "storage": _safe_float(app_state.get("storage")),
+            "status": hb.get("status") or ("alive" if hb.get("nodeAlive", True) else "dead"),
             "alive": hb.get("nodeAlive", True),
             "cycle": nd.get("cycle"),
-            "gossip_counter": nd.get("counter")
+            "gossip_counter": nd.get("counter"),
+            "node_id": nd.get("nodeState", {}).get("id", "")
         }
     return cluster
 
@@ -678,6 +737,13 @@ def start_standalone(config_path=None):
     own_ip = _get_own_ip()
     logger.info(f"Starting standalone node at {own_ip}:{port}")
 
+    # load TLS config FIRST — discovery needs it to talk to seeds over HTTPS
+    ssl_ctx = None
+    if load_tls_from_config:
+        tls_config = load_tls_from_config(cfg)
+        set_global_tls(tls_config)
+        ssl_ctx = tls_config.create_server_ssl_context()
+
     # discover peers from seeds or saved state
     os.environ["PRIOMON_STATE_FILE"] = state_file
     peer_list = discover_peers(seeds, own_ip, port, state_file)
@@ -703,6 +769,15 @@ def start_standalone(config_path=None):
         client_port=str(mon_port)
     )
 
+    # wire up mTLS on the node's gossip sessions
+    if ssl_ctx is not None:
+        node.configure_tls(tls_config)
+
+    # generate or load a persistent node identity
+    # the .node_id file lives in the same dir as peer_state.json
+    state_dir = os.path.dirname(state_file) if os.path.dirname(state_file) else None
+    node.load_or_create_node_id(state_dir=state_dir)
+
     # announce ourselves to all known peers
     announce_to_peers(peer_list, own_ip, port)
 
@@ -724,8 +799,8 @@ def start_standalone(config_path=None):
 
     threading.Thread(target=_delayed_gossip_start, daemon=True).start()
 
-    # start Flask
-    gossip.run(host=host, port=port, debug=False, threaded=True)
+    # start Flask (with SSL context if mTLS is configured)
+    gossip.run(host=host, port=port, debug=False, threaded=True, ssl_context=ssl_ctx)
 
 
 def _get_own_ip():

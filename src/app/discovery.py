@@ -12,6 +12,24 @@ logger = logging.getLogger("priomon.discovery")
 STATE_FILE_DEFAULT = "peer_state.json"
 
 
+def _get_tls_kwargs():
+    """Pull TLS request kwargs from the global config (if mTLS is on)."""
+    try:
+        from tls_utils import get_global_tls
+        return get_global_tls().get_request_kwargs()
+    except ImportError:
+        return {}
+
+
+def _get_scheme():
+    """http or https depending on TLS config."""
+    try:
+        from tls_utils import get_global_tls
+        return get_global_tls().scheme
+    except ImportError:
+        return "http"
+
+
 def discover_peers(seeds, own_ip, own_port, state_file=STATE_FILE_DEFAULT):
     """
     Try to join the cluster by contacting seed nodes.
@@ -20,6 +38,8 @@ def discover_peers(seeds, own_ip, own_port, state_file=STATE_FILE_DEFAULT):
     """
     own_key = f"{own_ip}:{own_port}"
     peers = []
+    scheme = _get_scheme()
+    tls_kwargs = _get_tls_kwargs()
 
     # first try seeds — they should return their peer list
     for seed in seeds:
@@ -28,8 +48,9 @@ def discover_peers(seeds, own_ip, own_port, state_file=STATE_FILE_DEFAULT):
         try:
             seed_ip, seed_port = seed.rsplit(":", 1)
             resp = requests.get(
-                f"http://{seed_ip}:{seed_port}/peers",
-                timeout=5
+                f"{scheme}://{seed_ip}:{seed_port}/peers",
+                timeout=5,
+                **tls_kwargs
             )
             if resp.status_code == 200:
                 peer_list = resp.json()
@@ -37,9 +58,10 @@ def discover_peers(seeds, own_ip, own_port, state_file=STATE_FILE_DEFAULT):
 
                 # now tell the seed we exist
                 requests.post(
-                    f"http://{seed_ip}:{seed_port}/join",
+                    f"{scheme}://{seed_ip}:{seed_port}/join",
                     json={"ip": own_ip, "port": str(own_port)},
-                    timeout=5
+                    timeout=5,
+                    **tls_kwargs
                 )
                 peers = peer_list
                 break  # one seed is enough
@@ -71,15 +93,19 @@ def announce_to_peers(peers, own_ip, own_port):
     Best-effort — failures here are fine, gossip will propagate eventually.
     """
     own_key = f"{own_ip}:{own_port}"
+    scheme = _get_scheme()
+    tls_kwargs = _get_tls_kwargs()
+
     for peer in peers:
         peer_key = f"{peer['ip']}:{peer['port']}"
         if peer_key == own_key:
             continue
         try:
             requests.post(
-                f"http://{peer['ip']}:{peer['port']}/join",
+                f"{scheme}://{peer['ip']}:{peer['port']}/join",
                 json={"ip": own_ip, "port": str(own_port)},
-                timeout=3
+                timeout=3,
+                **tls_kwargs
             )
         except Exception:
             pass  # they'll find out about us through gossip anyway

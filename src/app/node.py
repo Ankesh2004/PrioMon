@@ -1,6 +1,7 @@
 import time
 import json
 import os
+import uuid
 import psutil
 import requests
 from singleton import Singleton
@@ -76,14 +77,16 @@ def get_new_data():
         "cycle": "{}".format(node.cycle),
         "digest": "",
         "nodeState": {
-            "id": "",
+            "id": node.node_id or "",
             "ip": "{}".format(node.ip),
             "port": "{}".format(node.port)},
         "hbState": {
             "timestamp": "{}".format(time.time()),
-            "failureCount": node.failure_counter,
+            "failureCount": node.failure_counter or 0,
             "failureList": node.failure_list,
-            "nodeAlive": node.is_alive},
+            "nodeAlive": node.is_alive,
+            "status": "alive" if node.is_alive else "dead"
+        },
         "appState": app_state,
         "nfState": {},
         "metric_sent_flags": metric_flags
@@ -166,6 +169,52 @@ class Node:
         self.is_send_data_back = None
         self.metric_last_sent = {}
         self._state_save_thread = None
+        self._tls_scheme = "http"  # switches to https when mTLS is on
+        self.node_id = None  # persistent UUID, set during startup
+
+    def configure_tls(self, tls_config):
+        """Attach mTLS certs to our HTTP sessions so all gossip is encrypted and authenticated."""
+        if tls_config and tls_config.enabled:
+            tls_config.configure_session(self.gossip_session)
+            tls_config.configure_session(self.session_to_monitoring)
+            self._tls_scheme = "https"
+            logger.info("Node sessions configured with mTLS")
+
+    def load_or_create_node_id(self, state_dir=None):
+        """
+        Load or generate a persistent node identity.
+        The UUID is saved to a .node_id file so it survives restarts.
+        This means a node always has the same identity even if its IP changes.
+        """
+        # figure out where to store the ID file
+        if state_dir:
+            id_file = os.path.join(state_dir, ".node_id")
+        else:
+            id_file = ".node_id"
+
+        # try loading an existing identity
+        if os.path.exists(id_file):
+            try:
+                with open(id_file, "r") as f:
+                    saved_id = f.read().strip()
+                if saved_id:
+                    self.node_id = saved_id
+                    logger.info(f"Loaded node identity: {self.node_id}")
+                    return self.node_id
+            except Exception as e:
+                logger.warning(f"Couldn't read node ID file: {e}")
+
+        # first boot — generate a new UUID
+        self.node_id = str(uuid.uuid4())
+        try:
+            os.makedirs(os.path.dirname(id_file) if os.path.dirname(id_file) else ".", exist_ok=True)
+            with open(id_file, "w") as f:
+                f.write(self.node_id)
+            logger.info(f"Generated new node identity: {self.node_id}")
+        except Exception as e:
+            logger.warning(f"Couldn't persist node ID to disk: {e}")
+
+        return self.node_id
 
     def set_params(self, ip, port, cycle, node_list, data, is_alive, gossip_counter, failure_counter,
                    monitoring_address, database_address, is_send_data_back, client_thread, counter_thread, data_flow_per_round, push_mode, client_port):
@@ -273,7 +322,11 @@ class Node:
             if key != own_key and 'counter' in node_data
         }
 
-        return {'metadata': metadata, own_key: filtered_own_data}
+        # piggyback our peer list so it spreads through the network
+        # this is how nodes learn about peers they haven't directly contacted
+        peer_snapshot = [{"ip": p["ip"], "port": str(p["port"])} for p in self.node_list]
+
+        return {'metadata': metadata, own_key: filtered_own_data, '_peers': peer_snapshot}
 
     def prepare_requested_data(self, time_key, requested_keys):
         requested_data = {}
@@ -332,7 +385,7 @@ class Node:
             self.data = {latest_time_key: latest_data}
             to_push = {k: v for k, v in to_send.items() if k != latest_time_key}
             self.session_to_monitoring.post(
-                'http://{}:{}/push_data_to_database?ip={}&port={}&round={}'.format(self.monitoring_address,self.client_port ,self.ip,
+                '{}://{}:{}/push_data_to_database?ip={}&port={}&round={}'.format(self._tls_scheme, self.monitoring_address,self.client_port ,self.ip,
                                                                                  self.port,
                                                                                  self.cycle), json=to_push)
     
@@ -340,13 +393,13 @@ class Node:
         data = self.prepare_metadata_and_own_fresh_data(new_time_key)
         try:
             r_metadata_and_updated = self.gossip_session.post(
-                'http://' + n["ip"] + ':' + '5000' + '/receive_metadata',
+                self._tls_scheme + '://' + n["ip"] + ':' + n["port"] + '/receive_metadata',
                 json=data, timeout=5)
 
             requested_keys = r_metadata_and_updated.json()['requested_keys']
             requested_data = self.prepare_requested_data(new_time_key, requested_keys)
             response = self.gossip_session.get(
-                'http://' + n["ip"] + ':' + '5000' + '/receive_message?inc_round={}'.format(self.cycle),
+                self._tls_scheme + '://' + n["ip"] + ':' + n["port"] + '/receive_message?inc_round={}'.format(self.cycle),
                 json=requested_data, timeout=5)
             self.update_own_data(r_metadata_and_updated.json()['updates'], new_time_key)
             if response.status_code == 500:
@@ -354,20 +407,40 @@ class Node:
             else:
                 self.reset_failure_data(new_time_key, n["ip"] + ':' + n["port"])
         except Exception as e:
-            logging.error("Error while sending message to node {}: {}".format(n, e))
+            logger.warning(f"Error communicating with node {n['ip']}:{n['port']} - {e}")
+            self.update_failure_data(new_time_key, n)
 
     def update_failure_data(self, new_time_key, n):
-        if self.ip + ':' + self.port not in self.data[new_time_key].get(n["ip"] + ':' + n["port"], {}).get("hbState",
-                                                                                                           {}).get(
-            "failureList", []):
-            self.data[new_time_key][n["ip"] + ':' + n["port"]]["hbState"]["failureList"].append(
-                self.ip + ':' + self.port)
-            f_count = self.data[new_time_key].get(n["ip"] + ':' + n["port"], {}).get("hbState", {}).get("failureCount",
-                                                                                                        0) + 1
-            if f_count >= 3:
-                self.delete_node_from_nodelist(n["ip"] + ':' + n["port"])
-                self.data[new_time_key][n["ip"] + ':' + n["port"]]["hbState"]["nodeAlive"] = False
-        pass
+        target_key = f"{n['ip']}:{n['port']}"
+        own_key = f"{self.ip}:{self.port}"
+        
+        # initialize hbState if it doesn't exist for this target
+        target_data = self.data[new_time_key].setdefault(target_key, {})
+        hb_state = target_data.setdefault("hbState", {
+            "failureList": [], 
+            "failureCount": 0, 
+            "nodeAlive": True, 
+            "status": "alive"
+        })
+
+        # add ourselves to the suspect/failure list if we aren't already there
+        if own_key not in hb_state["failureList"]:
+            hb_state["failureList"].append(own_key)
+            hb_state["failureCount"] = len(hb_state["failureList"])
+            
+            f_count = hb_state["failureCount"]
+            if f_count < 3:
+                # Swim-style suspect state — we suspect it's dead, but wait for corroboration
+                hb_state["status"] = "suspect"
+                logger.debug(f"Node {target_key} is SUSPECT (failed for {own_key}, total {f_count})")
+            else:
+                # 3 nodes have corroborated the failure. Mark as DEAD.
+                hb_state["status"] = "dead"
+                hb_state["nodeAlive"] = False
+                logger.info(f"Node {target_key} declared DEAD (corroborated by {f_count} peers)")
+                self.delete_node_from_nodelist(target_key)
+                # Note: we do NOT delete it from self.data, so the "dead" tombstone 
+                # can still be gossiped and spread to other nodes.
 
     def delete_node_from_nodelist(self, key_to_delete):
         # node_list is a list of dicts with 'ip' and 'port', not a dict
@@ -376,12 +449,8 @@ class Node:
 
     def reset_failure_data(self, new_time_key, ip_key):
         if ip_key in self.data[new_time_key]:
-            self.data[new_time_key][ip_key]["hbState"]["failureCount"] = 0
-            self.data[new_time_key][ip_key]["hbState"]["nodeAlive"] = True
-            self.data[new_time_key][ip_key]["hbState"]["failureList"] = []
-        else:
-            self.data[new_time_key].setdefault(ip_key, {}).setdefault("hbState", {})[
-                "failureCount"] = 0
-            self.data[new_time_key].setdefault(ip_key, {}).setdefault("hbState", {})[
-                "failureList"] = []
-            self.data[new_time_key][ip_key]["hbState"]["nodeAlive"] = True
+            hb_state = self.data[new_time_key][ip_key].setdefault("hbState", {})
+            hb_state["failureCount"] = 0
+            hb_state["nodeAlive"] = True
+            hb_state["status"] = "alive"
+            hb_state["failureList"] = []

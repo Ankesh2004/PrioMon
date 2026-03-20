@@ -1,13 +1,10 @@
-# Example: run a 3-node PrioMon cluster in standalone mode
+# 2-node standalone PrioMon cluster with mTLS
 # No orchestrator needed — nodes discover each other via seeds
 #
 # Usage:
 #   docker-compose -f docker-compose.standalone.yml up --build
 #
-# Each node finds peers through seed addresses and starts gossiping automatically.
-# Node 1 starts first (as the seed), then nodes 2 and 3 join it.
-
-version: '3.8'
+# Node 1 starts first (as the seed), then node 2 joins it.
 
 services:
   node1:
@@ -22,15 +19,18 @@ services:
     volumes:
       - node1_state:/mini/state
       - ./standalone_configs:/mini/configs:ro
+      - ./certs:/mini/certs:ro
     ports:
       - "5001:5000"
     networks:
       - priomon_net
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=2)"]
+      # use curl-style check that works with both HTTP and HTTPS
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://localhost:5000/health', timeout=2, verify='/mini/certs/ca.crt', cert=('/mini/certs/node1.crt', '/mini/certs/node1.key'))"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 15s
 
   node2:
     build:
@@ -44,6 +44,7 @@ services:
     volumes:
       - node2_state:/mini/state
       - ./standalone_configs:/mini/configs:ro
+      - ./certs:/mini/certs:ro
     ports:
       - "5002:5000"
     networks:

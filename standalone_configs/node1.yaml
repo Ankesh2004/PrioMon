@@ -26,6 +26,13 @@ metric_deltas:
 
 state_file: "/mini/state/peer_state.json"
 
+# mTLS — enable to encrypt gossip and lock out unauthorized nodes
+tls:
+  enabled: true
+  ca_cert: "/mini/certs/ca.crt"
+  node_cert: "/mini/certs/node1.crt"
+  node_key: "/mini/certs/node1.key"
+
 monitoring:
   address: ""
   port: 4000
