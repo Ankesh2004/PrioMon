@@ -14,21 +14,21 @@ seeds:
 
 metric_priorities:
   cpu: 1
-  memory: 5
-  network: 5
-  storage: 10
+  memory: 1     
+  network: 1    
+  storage: 1    
 
 metric_deltas:
-  cpu: 5.0
-  memory: 7.0
-  network: 15.0
-  storage: 10.0
+  cpu: 0.0
+  memory: 0.0
+  network: 0.0
+  storage: 0.0
 
 state_file: "/mini/state/peer_state.json"
 
 # mTLS — enable to encrypt gossip and lock out unauthorized nodes
 tls:
-  enabled: true
+  enabled: false
   ca_cert: "/mini/certs/ca.crt"
   node_cert: "/mini/certs/node2.crt"
   node_key: "/mini/certs/node2.key"

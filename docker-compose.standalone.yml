@@ -26,7 +26,7 @@ services:
       - priomon_net
     healthcheck:
       # use curl-style check that works with both HTTP and HTTPS
-      test: ["CMD", "python", "-c", "import requests; requests.get('https://localhost:5000/health', timeout=2, verify='/mini/certs/ca.crt', cert=('/mini/certs/node1.crt', '/mini/certs/node1.key'))"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=2)"]
       interval: 10s
       timeout: 5s
       retries: 5
